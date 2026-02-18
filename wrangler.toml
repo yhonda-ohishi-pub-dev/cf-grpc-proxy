@@ -1,0 +1,21 @@
+name = "cf-grpc-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-12-18"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+RUST_LOGI_URL = "https://rust-logi-566bls5vfq-an.a.run.app"
+RUST_LOGI_PROXY_URL = "https://cloudrun-backend.mtamaramu.com"
+
+# Durable Object設定
+[durable_objects]
+bindings = [
+  { name = "GRPC_PROXY", class_name = "GrpcProxyDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["GrpcProxyDO"]
+
+# Google Cloud サービスアカウントの認証情報は Secret として設定
+# wrangler secret put GCP_SERVICE_ACCOUNT_JSON
