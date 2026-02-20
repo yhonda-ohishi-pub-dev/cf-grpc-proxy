@@ -167,10 +167,14 @@ export class GrpcProxyDO implements DurableObject {
       proxyHeaders.delete('Host');
       // x-auth-token はrust-logiのauth middlewareでJWT検証するため転送する
 
-      // JWT検証成功時: ユーザー情報ヘッダーを注入（クライアント値を上書き）
+      // JWT検証成功時: ユーザー情報ヘッダーを注入
       if (jwtPayload) {
         proxyHeaders.set('x-user-id', jwtPayload.sub);
-        proxyHeaders.set('x-organization-id', jwtPayload.org);
+        // クライアント指定のx-organization-idを保持（rust-logi middleware側でメンバーシップ検証）
+        const existingOrgId = proxyHeaders.get('x-organization-id');
+        if (!existingOrgId || existingOrgId.trim() === '') {
+          proxyHeaders.set('x-organization-id', jwtPayload.org);
+        }
       }
 
       const bodyBuffer = await request.arrayBuffer();
