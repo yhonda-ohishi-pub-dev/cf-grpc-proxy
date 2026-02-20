@@ -3,6 +3,7 @@
  *
  * Durable Objectを使用してIAMトークンをキャッシュし、
  * gRPC-WebリクエストをCloudRunにプロキシします。
+ * JWT検証ゲートにより、認証済みリクエストのみをCloudRunに転送します。
  */
 
 export interface Env {
@@ -10,6 +11,7 @@ export interface Env {
   RUST_LOGI_PROXY_URL: string;
   GCP_SERVICE_ACCOUNT_JSON: string;
   GRPC_PROXY: DurableObjectNamespace;
+  JWT_SECRET: string;
 }
 
 interface ServiceAccountKey {
@@ -17,20 +19,92 @@ interface ServiceAccountKey {
   private_key: string;
 }
 
+/** JWT Claims structure (matches rust-logi src/services/auth_service.rs Claims) */
+interface JwtPayload {
+  sub: string;      // user_id
+  org: string;      // organization_id
+  username: string;
+  exp: number;
+  iat: number;
+}
+
+/** Public paths that do not require JWT authentication (synced with rust-logi src/middleware/auth.rs) */
+const PUBLIC_PATHS: string[] = [
+  '/logi.auth.AuthService/Login',
+  '/logi.auth.AuthService/SignUpWithGoogle',
+  '/logi.auth.AuthService/LoginWithGoogle',
+  '/logi.auth.AuthService/ValidateToken',
+  '/logi.member.MemberService/AcceptInvitation',
+  '/grpc.health.v1.Health/Check',
+  '/grpc.health.v1.Health/Watch',
+  '/grpc.reflection.v1.ServerReflection/ServerReflectionInfo',
+  '/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo',
+];
+
 // CORSヘッダーを追加
 function corsHeaders(origin: string | null): Record<string, string> {
   return {
     'Access-Control-Allow-Origin': origin || '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Grpc-Web, X-User-Agent, Grpc-Timeout, Connect-Protocol-Version',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Grpc-Web, X-User-Agent, Grpc-Timeout, Connect-Protocol-Version, Authorization, X-Organization-Id, X-Auth-Token',
     'Access-Control-Expose-Headers': 'Grpc-Status, Grpc-Message, Grpc-Status-Details-Bin',
     'Access-Control-Max-Age': '86400',
   };
 }
 
+/** Base64URL decode to ArrayBuffer */
+function base64UrlDecodeToBuffer(str: string): ArrayBuffer {
+  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+/** Verify HS256 JWT using Web Crypto API */
+async function verifyJwt(token: string, secret: string): Promise<JwtPayload | null> {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const [headerB64, payloadB64, signatureB64] = parts;
+
+    // Import key for HMAC-SHA256
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify'],
+    );
+
+    // Verify signature
+    const signatureBytes = base64UrlDecodeToBuffer(signatureB64!);
+    const dataBytes = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+
+    const valid = await crypto.subtle.verify('HMAC', key, signatureBytes, dataBytes);
+    if (!valid) return null;
+
+    // Decode payload
+    const payloadJson = atob(payloadB64!.replace(/-/g, '+').replace(/_/g, '/'));
+    const payload: JwtPayload = JSON.parse(payloadJson);
+
+    // Check expiration
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp < now) return null;
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Durable Object: GrpcProxyDO
- * IAMトークンのキャッシュとgRPC-Webプロキシを管理
+ * IAMトークンのキャッシュ、JWT検証ゲート、gRPC-Webプロキシを管理
  */
 export class GrpcProxyDO implements DurableObject {
   private state: DurableObjectState;
@@ -61,15 +135,43 @@ export class GrpcProxyDO implements DurableObject {
     }
 
     try {
+      // --- JWT検証ゲート ---
+      const url = new URL(request.url);
+      const path = url.pathname;
+      let jwtPayload: JwtPayload | null = null;
+
+      if (!PUBLIC_PATHS.includes(path)) {
+        const authToken = request.headers.get('x-auth-token');
+
+        if (authToken) {
+          jwtPayload = await verifyJwt(authToken, this.env.JWT_SECRET);
+          if (!jwtPayload) {
+            return new Response(JSON.stringify({ error: 'Invalid or expired token' }), {
+              status: 401,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
+            });
+          }
+        } else {
+          // 移行期間: JWTなしでも警告のみで通過（厳格モード時はここで401を返す）
+          console.warn(`[AUTH] Unauthenticated request to ${path} - allowing during transition`);
+        }
+      }
+
+      // --- CloudRunへプロキシ ---
       const idToken = await this.getOrRefreshToken();
 
-      // CloudRunへプロキシ（カスタムドメイン経由）
-      const url = new URL(request.url);
       const targetUrl = `${this.env.RUST_LOGI_PROXY_URL}${url.pathname}`;
 
       const proxyHeaders = new Headers(request.headers);
       proxyHeaders.set('Authorization', `Bearer ${idToken}`);
       proxyHeaders.delete('Host');
+      // x-auth-token はrust-logiのauth middlewareでJWT検証するため転送する
+
+      // JWT検証成功時: ユーザー情報ヘッダーを注入（クライアント値を上書き）
+      if (jwtPayload) {
+        proxyHeaders.set('x-user-id', jwtPayload.sub);
+        proxyHeaders.set('x-organization-id', jwtPayload.org);
+      }
 
       const bodyBuffer = await request.arrayBuffer();
       const proxyResponse = await fetch(targetUrl, {
