@@ -34,6 +34,8 @@ const PUBLIC_PATHS: string[] = [
   '/logi.auth.AuthService/SignUpWithGoogle',
   '/logi.auth.AuthService/LoginWithGoogle',
   '/logi.auth.AuthService/ValidateToken',
+  '/logi.auth.AuthService/ResolveSsoProvider',
+  '/logi.auth.AuthService/LoginWithSsoProvider',
   '/logi.member.MemberService/AcceptInvitation',
   '/grpc.health.v1.Health/Check',
   '/grpc.health.v1.Health/Watch',
