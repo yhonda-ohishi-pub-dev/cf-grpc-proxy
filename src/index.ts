@@ -4,13 +4,18 @@
  * Durable Objectを使用してIAMトークンをキャッシュし、
  * gRPC-WebリクエストをCloudRunにプロキシします。
  * JWT検証ゲートにより、認証済みリクエストのみをCloudRunに転送します。
+ *
+ * ItemsSyncDO: WebSocket Hibernation APIを使ったマルチブラウザ同期
  */
+
+import { DurableObject as BaseDurableObject } from 'cloudflare:workers';
 
 export interface Env {
   RUST_LOGI_URL: string;
   RUST_LOGI_PROXY_URL: string;
   GCP_SERVICE_ACCOUNT_JSON: string;
   GRPC_PROXY: DurableObjectNamespace;
+  ITEMS_SYNC: DurableObjectNamespace;
   JWT_SECRET: string;
 }
 
@@ -325,15 +330,124 @@ export class GrpcProxyDO implements DurableObject {
 }
 
 /**
+ * Durable Object: ItemsSyncDO (WebSocket Hibernation API)
+ * マルチブラウザ同期: アイテムCRUD通知をWebSocketでブロードキャスト
+ * Room粒度: org_id単位 (items-{orgId})
+ */
+export class ItemsSyncDO extends BaseDurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // ping/pong をDO起動なしで自動応答（Hibernation中もコネクション維持）
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('ping', 'pong'),
+    );
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 });
+    }
+
+    // JWTをクエリパラメータから検証（WebSocketはカスタムヘッダー不可）
+    const url = new URL(request.url);
+    const token = url.searchParams.get('token');
+    if (!token) {
+      return new Response('Missing token', { status: 401 });
+    }
+
+    const payload = await verifyJwt(token, this.env.JWT_SECRET);
+    if (!payload) {
+      return new Response('Invalid or expired token', { status: 401 });
+    }
+
+    // WebSocketペア作成
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Hibernation API: acceptWebSocket + userIdタグ（personalアイテムフィルタ用）
+    this.ctx.acceptWebSocket(server, [payload.sub]);
+    server.serializeAttachment({ userId: payload.sub });
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== 'string') return;
+
+    try {
+      const data = JSON.parse(message);
+      if (data.type !== 'items_changed') return;
+
+      const sender = ws.deserializeAttachment() as { userId: string };
+
+      const broadcastMsg = JSON.stringify({
+        type: 'items_changed',
+        action: data.action,
+        parentId: data.parentId,
+        ownerType: data.ownerType,
+        userId: sender.userId,
+      });
+
+      // 全接続クライアントに配信（送信元除外）
+      for (const sock of this.ctx.getWebSockets()) {
+        if (sock === ws) continue;
+
+        if (data.ownerType === 'personal') {
+          // personalアイテム: 同一ユーザーの別デバイスにのみ通知
+          const att = sock.deserializeAttachment() as { userId: string } | null;
+          if (att?.userId === sender.userId) {
+            sock.send(broadcastMsg);
+          }
+        } else {
+          // orgアイテム: 全員に通知
+          sock.send(broadcastMsg);
+        }
+      }
+    } catch {
+      // malformed message は無視
+    }
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
+    ws.close(code, reason);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    console.error('ItemsSyncDO WebSocket error:', error);
+    ws.close(1011, 'Internal error');
+  }
+}
+
+/**
  * Worker エントリーポイント
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Durable Object IDを生成（シングルトン）
+    const url = new URL(request.url);
+
+    // WebSocket同期: /ws/items/{orgId}
+    if (url.pathname.startsWith('/ws/items/')) {
+      const orgId = url.pathname.split('/')[3];
+      if (!orgId) {
+        return new Response('Missing orgId', { status: 400 });
+      }
+
+      // CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 204,
+          headers: corsHeaders(request.headers.get('Origin')),
+        });
+      }
+
+      // org_id単位でDOインスタンスを分離
+      const doId = env.ITEMS_SYNC.idFromName(`items-${orgId}`);
+      return env.ITEMS_SYNC.get(doId).fetch(request);
+    }
+
+    // 既存gRPCプロキシ（シングルトン）
     const id = env.GRPC_PROXY.idFromName('grpc-proxy');
     const stub = env.GRPC_PROXY.get(id);
-
-    // Durable Objectにリクエストを転送
     return stub.fetch(request);
   },
 };

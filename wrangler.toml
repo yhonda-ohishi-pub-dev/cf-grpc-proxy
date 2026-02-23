@@ -10,12 +10,22 @@ RUST_LOGI_PROXY_URL = "https://cloudrun-backend.mtamaramu.com"
 # Durable Object設定
 [durable_objects]
 bindings = [
-  { name = "GRPC_PROXY", class_name = "GrpcProxyDO" }
+  { name = "GRPC_PROXY", class_name = "GrpcProxyDO" },
+  { name = "ITEMS_SYNC", class_name = "ItemsSyncDO" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["GrpcProxyDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["ItemsSyncDO"]
+
+# WebSocket同期用カスタムドメイン
+[[routes]]
+pattern = "sync.mtamaramu.com"
+custom_domain = true
 
 # Google Cloud サービスアカウントの認証情報は Secret として設定
 # wrangler secret put GCP_SERVICE_ACCOUNT_JSON
