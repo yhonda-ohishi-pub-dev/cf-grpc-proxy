@@ -4,6 +4,7 @@
  * Durable Objectを使用してIAMトークンをキャッシュし、
  * gRPC-WebリクエストをCloudRunにプロキシします。
  * JWT検証ゲートにより、認証済みリクエストのみをCloudRunに転送します。
+ * 
  *
  * ItemsSyncDO: WebSocket Hibernation APIを使ったマルチブラウザ同期
  */
@@ -461,7 +462,7 @@ export default {
       return env.ITEMS_SYNC.get(doId).fetch(request);
     }
 
-    // 既存gRPCプロキシ（シングルトン）
+    // gRPCプロキシ（シングルトン）
     const id = env.GRPC_PROXY.idFromName('grpc-proxy');
     const stub = env.GRPC_PROXY.get(id);
     return stub.fetch(request);
