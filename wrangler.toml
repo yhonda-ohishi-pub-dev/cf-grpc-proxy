@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 RUST_LOGI_URL = "https://rust-logi-566bls5vfq-an.a.run.app"
-RUST_LOGI_PROXY_URL = "https://cloudrun-backend.mtamaramu.com"
+RUST_LOGI_PROXY_URL = "https://api-container.mtamaramu.com"
 
 # Durable Object設定
 [durable_objects]

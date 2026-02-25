@@ -48,6 +48,32 @@ const PUBLIC_PATHS: string[] = [
   '/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo',
 ];
 
+/**
+ * gRPC-Web trailer-only エラーレスポンスを生成
+ * connect-web が正しくパースできる形式（JSON ではなく gRPC-Web フレーム）
+ */
+function grpcWebError(
+  grpcStatus: number,
+  message: string,
+  origin: string | null,
+): Response {
+  const trailerText = `grpc-status: ${grpcStatus}\r\ngrpc-message: ${encodeURIComponent(message)}\r\n`;
+  const trailerBytes = new TextEncoder().encode(trailerText);
+  const frame = new Uint8Array(5 + trailerBytes.length);
+  frame[0] = 0x80; // trailer frame flag
+  new DataView(frame.buffer).setUint32(1, trailerBytes.length);
+  frame.set(trailerBytes, 5);
+
+  return new Response(frame, {
+    status: 200, // gRPC-Web always returns HTTP 200
+    headers: {
+      'Content-Type': 'application/grpc-web+proto',
+      'Content-Length': String(frame.length),
+      ...corsHeaders(origin),
+    },
+  });
+}
+
 // CORSヘッダーを追加
 function corsHeaders(origin: string | null): Record<string, string> {
   return {
@@ -153,10 +179,7 @@ export class GrpcProxyDO implements DurableObject {
         if (authToken) {
           jwtPayload = await verifyJwt(authToken, this.env.JWT_SECRET);
           if (!jwtPayload) {
-            return new Response(JSON.stringify({ error: 'Invalid or expired token' }), {
-              status: 401,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
-            });
+            return grpcWebError(16, 'Invalid or expired token', origin); // UNAUTHENTICATED
           }
         } else {
           // 移行期間: JWTなしでも警告のみで通過（厳格モード時はここで401を返す）
@@ -164,13 +187,15 @@ export class GrpcProxyDO implements DurableObject {
         }
       }
 
-      // --- CloudRunへプロキシ ---
-      const idToken = await this.getOrRefreshToken();
-
+      // --- バックエンドへプロキシ ---
       const targetUrl = `${this.env.RUST_LOGI_PROXY_URL}${url.pathname}`;
 
       const proxyHeaders = new Headers(request.headers);
-      proxyHeaders.set('Authorization', `Bearer ${idToken}`);
+      // Cloud Run使用時のみIAMトークンを付与（CF Containers時はGCP_SERVICE_ACCOUNT_JSONが未設定）
+      if (this.env.GCP_SERVICE_ACCOUNT_JSON) {
+        const idToken = await this.getOrRefreshToken();
+        proxyHeaders.set('Authorization', `Bearer ${idToken}`);
+      }
       proxyHeaders.delete('Host');
       // x-auth-token はrust-logiのauth middlewareでJWT検証するため転送する
 
@@ -203,16 +228,7 @@ export class GrpcProxyDO implements DurableObject {
       });
     } catch (error) {
       console.error('Proxy error:', error);
-      return new Response(
-        JSON.stringify({ error: 'Internal server error', details: String(error) }),
-        {
-          status: 500,
-          headers: {
-            'Content-Type': 'application/json',
-            ...corsHeaders(origin),
-          },
-        }
-      );
+      return grpcWebError(13, `Internal server error: ${String(error)}`, origin); // INTERNAL
     }
   }
 
